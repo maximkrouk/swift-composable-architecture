@@ -575,7 +575,7 @@ public final class TestStore<State: Equatable, Action> {
     let duration = duration ?? self.timeout
     let clock = ContinuousClock()
     let deadline = clock.now.advanced(by: duration)
-    await Task.megaYield()
+    await Task._settle()
     while !self.reducer.inFlightEffects.isEmpty {
       guard clock.now < deadline
       else {
@@ -976,7 +976,7 @@ extension TestStore {
       }
       // NB: Give concurrency runtime more time to kick off effects so users don't need to manually
       //     instrument their effects.
-      await Task.megaYield(count: 20)
+      await Task._settle(count: 20)
       return .init(rawValue: task.rawValue, timeout: self.timeout)
     }
   }
@@ -1354,7 +1354,7 @@ extension TestStore where Action: Equatable {
           column: column
         )
       }()
-      await Task.megaYield()
+      await Task._settle()
     }
   }
 }
@@ -1545,7 +1545,7 @@ extension TestStore {
           column: column
         )
       }()
-      await Task.megaYield()
+      await Task._settle()
     }
   }
 
@@ -1647,7 +1647,7 @@ extension TestStore {
           column: column
         )
       }()
-      await Task.megaYield()
+      await Task._settle()
     }
   }
 
@@ -1727,7 +1727,7 @@ extension TestStore {
           column: column
         )
       }()
-      await Task.megaYield()
+      await Task._settle()
     }
   }
 
@@ -1851,9 +1851,12 @@ extension TestStore {
     let clock = ContinuousClock()
     let deadline = clock.now.advanced(by: duration)
 
-    await Task.megaYield()
+    await Task._settle()
     while !Task.isCancelled {
-      await Task.detached(priority: .background) { await Task.yield() }.value
+      // NB: Poll at the caller's priority and on a timer: a `.background` hop waits until the
+      //     whole cooperative pool is idle, which a busy machine or a parallel test run starves.
+      await Task.yield()
+      try? await Task.sleep(nanoseconds: NSEC_PER_MSEC)
 
       switch self.exhaustivity {
       case .on:
@@ -2042,7 +2045,7 @@ extension TestStore {
     line: UInt = #line,
     column: UInt = #column
   ) async {
-    await Task.megaYield()
+    await Task._settle()
     _ = {
       self._skipReceivedActions(
         strict: strict,
@@ -2131,7 +2134,7 @@ extension TestStore {
     line: UInt = #line,
     column: UInt = #column
   ) async {
-    await Task.megaYield()
+    await Task._settle()
     _ = {
       self._skipInFlightEffects(
         strict: strict,
@@ -2294,7 +2297,7 @@ public struct TestStoreTask: Hashable, Sendable {
     column: UInt = #column
   ) async {
     let duration = duration ?? self.timeout
-    await Task.megaYield()
+    await Task._settle()
     do {
       try await withThrowingTaskGroup(of: Void.self) { group in
         group.addTask { await self.rawValue?.cancellableValue }
@@ -2400,7 +2403,7 @@ class TestReducer<State: Equatable, Action>: Reducer {
             receiveSubscription: { _ in
               self?.inFlightEffects.insert(effect)
               Task {
-                await Task.megaYield()
+                await Task._settle()
                 effectDidSubscribe.continuation.yield()
               }
             },
@@ -2535,4 +2538,21 @@ private func _withIssueContext<R>(
   )
   await Task.yield()
   return result
+}
+
+extension Task where Success == Never, Failure == Never {
+  /// Gives work the store started a chance to run, as `Task.megaYield` does, but at the caller's
+  /// priority.
+  ///
+  /// `megaYield` hops through `.background` tasks. Those wait behind every higher-priority job in
+  /// the cooperative pool and run only on efficiency cores, so on a busy machine, or in a parallel
+  /// test run that keeps the pool full, a single `send` could take tens of seconds. Hops at the
+  /// caller's priority still queue behind the work the store's effects started at that priority,
+  /// which is what the hops are for, without waiting for the rest of the process or the machine.
+  fileprivate static func _settle(count: Int = _defaultMegaYieldCount) async {
+    let priority = Task<Never, Never>.currentPriority
+    for _ in 0..<count {
+      await Task<Void, Never>.detached(priority: priority) { await Task<Never, Never>.yield() }.value
+    }
+  }
 }
